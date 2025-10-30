@@ -7,6 +7,9 @@ uniform sampler2D texture1;
 // texelOffset can be set from the program if desired. If not provided,
 // the shader uses a reasonable default.
 uniform vec2 texelOffset; // expected to be (1.0/width, 1.0/height)
+// Optional threshold to suppress weak edges on the GPU.
+// If <= 0.0 the shader preserves the original behavior (no threshold).
+uniform float edgeThreshold;
 
 void main() {
     vec2 off = texelOffset;
@@ -30,5 +33,13 @@ void main() {
     float gy = (bl + 2.0*bc + br) - (tl + 2.0*tc + tr);
 
     float g = length(vec2(gx, gy));
-    FragColor = vec4(vec3(g), 1.0);
+    // If edgeThreshold is <= 0, keep original raw gradient magnitude.
+    if (edgeThreshold <= 0.0) {
+        FragColor = vec4(vec3(g), 1.0);
+    } else {
+        // Soft threshold to reduce sensitivity. The second parameter
+        // controls the soft knee width; tune as needed from CPU.
+        float edge = smoothstep(edgeThreshold, edgeThreshold + 0.05, g);
+        FragColor = vec4(vec3(edge), 1.0);
+    }
 }

@@ -63,6 +63,8 @@ common/Shader.cpp
     common/Quad.hpp
     filters/Filters.cpp
     filters/Filters.hpp
+    transforms/Transforms.cpp
+    transforms/Transforms.hpp
     Webcam/webcamQuad.cpp
 )
 target_link_libraries(Webcam

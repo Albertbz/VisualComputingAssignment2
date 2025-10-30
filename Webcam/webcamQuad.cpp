@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <cmath>
 #include <iostream>
 #include <string>
 #define GLAD_GL_IMPLEMENTATION
@@ -37,11 +38,98 @@ using namespace glm;
 #include <opencv2/opencv.hpp>
 
 #include "filters/Filters.hpp"
+#include "transforms/Transforms.hpp"
 
 using namespace std;
 
 // Helper function to initialize the window
 bool initWindow(std::string windowName);
+
+// --- Simple global transform state for mouse interaction (UV space) -----
+static bool g_isDragging = false;
+static double g_lastX = 0.0, g_lastY = 0.0;
+static float g_translateU = 0.0f, g_translateV = 0.0f;
+static float g_scale = 1.0f;
+static float g_rotation = 0.0f;  // degrees, positive = CCW
+// Transform toggles accessible from callbacks
+static bool g_transformsEnabled = false;
+static bool g_transformsUseCPU =
+    false;  // when true, apply transforms on CPU (cv::Mat)
+static bool g_gpuTransformActive =
+    false;  // whether we have set the GPU transform shader
+
+// GLFW callbacks (defined here so they can access the static globals)
+static void scroll_callback(GLFWwindow* win, double xoffset, double yoffset) {
+    // Zoom around current cursor position
+    double mx, my;
+    int w, h;
+    glfwGetCursorPos(win, &mx, &my);
+    glfwGetWindowSize(win, &w, &h);
+    if (w <= 0 || h <= 0) return;
+    // If GPU, invert mx and my
+    if (g_gpuTransformActive) {
+        mx = w - mx;
+        my = h - my;
+    }
+    // Convert to UV (0..1). Note: window y is top-down so invert Y to get
+    // UV-space where V increases upwards.
+    float px = (float)(mx / (double)w);
+    float py = (float)(my / (double)h);
+
+    float oldScale = g_scale;
+    // scale exponentially for smooth zooming
+    // if GPU, invert zoom direction
+    float dir = g_gpuTransformActive ? -1.0f : 1.0f;
+    float factor = powf(1.1f, (float)yoffset * dir);
+    float newScale = oldScale * factor;
+
+    // Keep the point under cursor fixed. The shader composes scale around
+    // the image center, so we must account for the center (cx,cy).
+    // Derived: t_new = t_old + (s_old - s_new) * (p - c)
+    float s_old = oldScale;
+    float s_new = newScale;
+    float cx = 0.5f, cy = 0.5f;
+    g_translateU = g_translateU + (s_old - s_new) * (px - cx);
+    g_translateV = g_translateV + (s_old - s_new) * (py - cy);
+    g_scale = s_new;
+}
+
+static void mouse_button_callback(GLFWwindow* win, int button, int action,
+                                  int mods) {
+    if (button != GLFW_MOUSE_BUTTON_LEFT) return;
+    if (action == GLFW_PRESS) {
+        g_isDragging = true;
+        glfwGetCursorPos(win, &g_lastX, &g_lastY);
+    } else if (action == GLFW_RELEASE) {
+        g_isDragging = false;
+    }
+}
+
+static void cursor_pos_callback(GLFWwindow* win, double xpos, double ypos) {
+    if (!g_isDragging) return;
+    int w, h;
+    glfwGetWindowSize(win, &w, &h);
+    if (w <= 0 || h <= 0) return;
+    double dx = xpos - g_lastX;
+    double dy = ypos - g_lastY;
+    // Convert pixel delta to UV delta. GLFW Y is top-down, so invert the
+    // vertical delta: moving the mouse up should increase V.
+    // If shift is held, interpret horizontal drag as rotation.
+    int shiftLeft = glfwGetKey(win, GLFW_KEY_LEFT_SHIFT);
+    int shiftRight = glfwGetKey(win, GLFW_KEY_RIGHT_SHIFT);
+    if (shiftLeft == GLFW_PRESS || shiftRight == GLFW_PRESS) {
+        // rotation sensitivity: degrees per pixel (tweakable)
+        const float rotSens = 0.35f;
+        g_rotation += (float)dx * rotSens;
+    } else {
+        float du = (float)(dx / (double)w);
+        float dv = (float)(dy / (double)h);
+        g_translateU += du;
+        g_translateV += dv;
+    }
+    g_lastX = xpos;
+    g_lastY = ypos;
+}
 
 /* ------------------------------------------------------------------------- */
 /* main                                                                      */
@@ -69,6 +157,10 @@ int main(void) {
 
     // Basic OpenGL setup
     glfwSetInputMode(window, GLFW_STICKY_KEYS, GL_TRUE);
+    // Install mouse/scroll callbacks for interactive transforms
+    glfwSetScrollCallback(window, scroll_callback);
+    glfwSetMouseButtonCallback(window, mouse_button_callback);
+    glfwSetCursorPosCallback(window, cursor_pos_callback);
     glClearColor(0.1f, 0.1f, 0.2f, 0.0f);  // A dark blue background
     glEnable(GL_DEPTH_TEST);
 
@@ -114,9 +206,14 @@ int main(void) {
     textureShader->setTexture(videoTexture);
 
     // Keys we watch for toggles (kept for backwards compatibility)
+    // Add T = toggle transforms on/off, C = toggle CPU/GPU transform mode
     const int keysToWatch[] = {GLFW_KEY_1, GLFW_KEY_2, GLFW_KEY_3, GLFW_KEY_4,
-                               GLFW_KEY_G, GLFW_KEY_E, GLFW_KEY_P};
+                               GLFW_KEY_G, GLFW_KEY_E, GLFW_KEY_P, GLFW_KEY_T,
+                               GLFW_KEY_C, GLFW_KEY_R};
     bool prevKeyState[sizeof(keysToWatch) / sizeof(keysToWatch[0])] = {false};
+
+    // Transform toggles
+    // (moved to file-level globals so callbacks can see them)
 
     auto setDefaultShaderOnQuad = [&](void) {
         TextureShader* sh = new TextureShader("videoTextureShader.vert",
@@ -207,6 +304,50 @@ int main(void) {
                         cout << "Filter: GPU PIXELATE\n";
                         currentMode = FilterMode::GPU_PIXELATE;
                         break;
+                    case GLFW_KEY_T:
+                        g_transformsEnabled = !g_transformsEnabled;
+                        cout << "Transforms "
+                             << (g_transformsEnabled ? "ENABLED" : "DISABLED")
+                             << "\n";
+                        // If enabling GPU transforms, switch shader
+                        if (g_transformsEnabled && !g_transformsUseCPU) {
+                            setGPUShaderOnQuad(
+                                Transforms::gpuFragmentPathTransform());
+                            g_gpuTransformActive = true;
+                        } else {
+                            // disabling transforms or switching to CPU: restore
+                            // default shader
+                            if (g_gpuTransformActive) {
+                                setDefaultShaderOnQuad();
+                                g_gpuTransformActive = false;
+                            }
+                        }
+                        break;
+                    case GLFW_KEY_C:
+                        g_transformsUseCPU = !g_transformsUseCPU;
+                        cout << "Transform mode: "
+                             << (g_transformsUseCPU ? "CPU" : "GPU") << "\n";
+                        // If switching to GPU while transforms are enabled, set
+                        // GPU shader
+                        if (g_transformsEnabled && !g_transformsUseCPU) {
+                            setGPUShaderOnQuad(
+                                Transforms::gpuFragmentPathTransform());
+                            g_gpuTransformActive = true;
+                        } else {
+                            if (g_gpuTransformActive) {
+                                setDefaultShaderOnQuad();
+                                g_gpuTransformActive = false;
+                            }
+                        }
+                        break;
+                    case GLFW_KEY_R:
+                        // Reset transforms to identity
+                        g_translateU = 0.0f;
+                        g_translateV = 0.0f;
+                        g_scale = 1.0f;
+                        g_rotation = 0.0f;
+                        cout << "Transforms reset to identity\n";
+                        break;
                 }
             }
             prevKeyState[i] = cur;
@@ -230,6 +371,28 @@ int main(void) {
                     break;
             }
 
+            // Apply CPU transforms if enabled and requested
+            if (g_transformsEnabled && g_transformsUseCPU) {
+                // Convert UV-space translate/scale to pixel-space. UV +V is up,
+                // image pixel Y increases downward, so invert V when mapping
+                // to pixel-space.
+                float dx_pixels = -g_translateU * (float)frame.cols;
+                // UV +V is up, image pixel Y increases downward, so invert V
+                // when mapping to pixel-space for CPU transforms.
+                float dy_pixels = g_translateV * (float)frame.rows;
+                // Apply scale around center first, then translate
+                if (fabs(g_scale - 1.0f) > 1e-6f) {
+                    Transforms::applyScaleCPU(frame, g_scale, g_scale);
+                }
+                // Apply rotation around center (degrees)
+                if (fabs(g_rotation) > 1e-6f) {
+                    Transforms::applyRotateCPU(frame, g_rotation);
+                }
+                if (fabs(dx_pixels) > 0.0f || fabs(dy_pixels) > 0.0f) {
+                    Transforms::applyTranslateCPU(frame, dx_pixels, dy_pixels);
+                }
+            }
+
             // Flip the frame vertically for OpenGL texture coordinates
             cv::flip(frame, frame, 0);
 
@@ -238,6 +401,79 @@ int main(void) {
         }
 
         // Render the scene from the camera's point of view
+        // Bind the quad's shader and upload the UV transform if present
+        myQuad->bindShaders();
+        {
+            GLint prog = 0;
+            glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+            if (prog != 0) {
+                GLint loc = glGetUniformLocation((GLuint)prog, "uTransform");
+                if (loc >= 0) {
+                    // Build a 3x3 UV transform: translate * T(center) *
+                    // S(scale) * T(-center)
+                    float cx = 0.5f, cy = 0.5f;
+                    glm::mat3 T_neg(1.0f);
+                    T_neg[2][0] = -cx;
+                    T_neg[2][1] = -cy;
+                    glm::mat3 S(1.0f);
+                    S[0][0] = g_scale;
+                    S[1][1] = g_scale;
+                    glm::mat3 T_back(1.0f);
+                    T_back[2][0] = cx;
+                    T_back[2][1] = cy;
+                    // Rotation around center (convert degrees to radians)
+                    glm::mat3 R(1.0f);
+                    float ang = glm::radians(g_rotation);
+                    float ca = std::cos(ang);
+                    float sa = std::sin(ang);
+                    // column-major: set columns accordingly
+                    R[0][0] = ca;
+                    R[0][1] = sa;
+                    R[1][0] = -sa;
+                    R[1][1] = ca;
+                    glm::mat3 T_translate(1.0f);
+                    T_translate[2][0] = g_translateU;
+                    T_translate[2][1] = g_translateV;
+                    // Compensate for the quad's aspect ratio so rotations in UV
+                    // space behave like pixel-space rotations. The quad is
+                    // created with the video aspect ratio, so X and Y are
+                    // scaled differently; to rotate without warping we scale X
+                    // by aspect, rotate, then undo the scale.
+                    float aspect = 1.0f;
+                    if (!frame.empty() && frame.rows != 0) {
+                        aspect = (float)frame.cols / (float)frame.rows;
+                    }
+                    glm::mat3 A(1.0f);     // scale X by aspect
+                    glm::mat3 Ainv(1.0f);  // inverse: scale X by 1/aspect
+                    A[0][0] = aspect;
+                    Ainv[0][0] = 1.0f / aspect;
+
+                    // Compose with aspect compensation: translate * back * Ainv
+                    // * R * S * A * T_neg
+                    glm::mat3 M =
+                        T_translate * T_back * Ainv * R * S * A * T_neg;
+                    glUniformMatrix3fv(loc, 1, GL_FALSE, &M[0][0]);
+                }
+                // Provide texel offset to shaders that sample neighbors
+                GLint locTexel =
+                    glGetUniformLocation((GLuint)prog, "texelOffset");
+                if (locTexel >= 0) {
+                    // frame.cols/rows are > 0 here (frame checked earlier)
+                    glUniform2f(locTexel, 1.0f / (float)frame.cols,
+                                1.0f / (float)frame.rows);
+                }
+                // Provide an edge threshold uniform used by GPU edge shader.
+                // When not in GPU edge mode we set it to 0.0 to preserve
+                // previous behavior (raw gradient magnitude).
+                GLint locEdge =
+                    glGetUniformLocation((GLuint)prog, "edgeThreshold");
+                if (locEdge >= 0) {
+                    float thr =
+                        (currentMode == FilterMode::GPU_EDGE) ? 0.2f : 0.0f;
+                    glUniform1f(locEdge, thr);
+                }
+            }
+        }
         myScene->render(renderingCamera);
 
         glfwSwapBuffers(window);
