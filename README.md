@@ -55,7 +55,13 @@ If the executable can't find shader files at runtime, ensure your working direct
   - `G` — GPU Grayscale
   - `E` — GPU Edge
   - `P` — GPU Pixelate
+  - `T` - Enable transformations
+  - `C` - Change between backends when transformations are on
   - `ESC` — Quit
+- Mouse input (when transformations are enabled)
+  - Scroll to zoom in and out
+  - Click and drag to translate
+  - SHIFT + Click and drag horizontally to rotate
 
 ## Camera selection
 
